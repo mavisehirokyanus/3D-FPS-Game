@@ -91,11 +91,12 @@
             text-transform: uppercase;
             letter-spacing: 1px;
         }
+        .btn:disabled { opacity: 0.5; cursor: not-allowed; }
         #join-btn { background: #ff4444; margin-bottom: 10px; }
-        #join-btn:hover { background: #cc0000; transform: translateY(-2px); box-shadow: 0 5px 15px rgba(255,68,68,0.3); }
+        #join-btn:hover:not(:disabled) { background: #cc0000; transform: translateY(-2px); box-shadow: 0 5px 15px rgba(255,68,68,0.3); }
         
         #create-btn { background: #4444ff; }
-        #create-btn:hover { background: #3333cc; transform: translateY(-2px); box-shadow: 0 5px 15px rgba(68,68,255,0.3); }
+        #create-btn:hover:not(:disabled) { background: #3333cc; transform: translateY(-2px); box-shadow: 0 5px 15px rgba(68,68,255,0.3); }
 
         #player-id-tag {
             position: absolute; bottom: 20px; right: 20px; color: #777; font-size: 0.8rem; display: none;
@@ -144,7 +145,7 @@
         import { getAuth, signInAnonymously, onAuthStateChanged, signInWithCustomToken } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
         import { getFirestore, doc, setDoc, onSnapshot, collection, deleteDoc, serverTimestamp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
 
-        // Firebase Configuration
+        // Global IDs and Config
         const firebaseConfig = JSON.parse(__firebase_config);
         const app = initializeApp(firebaseConfig);
         const auth = getAuth(app);
@@ -163,12 +164,26 @@
         let currentUser = null;
         let selectedPort = "";
         let isGameStarted = false;
+        let isAuthStarted = false;
 
         const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
 
-        // --- Auth Initialization ---
+        // --- Auth Function ---
         const initAuth = async () => {
             if (currentUser) return currentUser;
+            if (isAuthStarted) {
+                // Wait for existing auth process
+                return new Promise((resolve) => {
+                    const unsubscribe = onAuthStateChanged(auth, (user) => {
+                        if (user) {
+                            unsubscribe();
+                            resolve(user);
+                        }
+                    });
+                });
+            }
+
+            isAuthStarted = true;
             if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
                 const result = await signInWithCustomToken(auth, __initial_auth_token);
                 currentUser = result.user;
@@ -183,6 +198,7 @@
             currentUser = user;
             if (user) {
                 document.getElementById('myId').innerText = user.uid;
+                // If the game was already triggered, start syncing now
                 if (isGameStarted && selectedPort) {
                     startSync();
                 }
@@ -196,25 +212,39 @@
         const instructions = document.getElementById('instructions');
 
         async function startGame(port) {
+            if (isGameStarted) return;
+            
             selectedPort = port;
             document.getElementById('currentPort').innerText = port;
             
-            // Start Auth early
-            try {
-                await initAuth();
-            } catch (e) {
-                console.error("Auth Error:", e);
-                return;
-            }
+            // UI Feedback
+            joinBtn.disabled = true;
+            createBtn.disabled = true;
+            joinBtn.innerText = "BAĞLANILIYOR...";
 
-            document.body.requestPointerLock();
-            if (audioCtx.state === 'suspended') audioCtx.resume();
-            
-            if (!isGameStarted) {
-                init();
-                isGameStarted = true;
-                // Double check sync start
-                if (currentUser) startSync();
+            try {
+                // MANDATORY: Auth before any Firestore calls
+                await initAuth();
+                
+                if (!isGameStarted) {
+                    init(); // 3D init
+                    isGameStarted = true;
+                    startSync(); // Firestore init
+                }
+
+                document.body.requestPointerLock();
+                if (audioCtx.state === 'suspended') audioCtx.resume();
+                
+                instructions.style.display = 'none';
+                document.getElementById('ui-container').style.display = 'block';
+                document.getElementById('crosshair').style.display = 'block';
+                document.getElementById('player-id-tag').style.display = 'block';
+            } catch (e) {
+                console.error("Critical Start Error:", e);
+                alert("Bağlantı hatası: " + e.message);
+                joinBtn.disabled = false;
+                createBtn.disabled = false;
+                joinBtn.innerText = "PORTA KATIL";
             }
         }
 
@@ -234,27 +264,28 @@
         });
 
         document.addEventListener('pointerlockchange', () => {
-            if (document.pointerLockElement === document.body) {
-                instructions.style.display = 'none';
-                document.getElementById('ui-container').style.display = 'block';
-                document.getElementById('crosshair').style.display = 'block';
-                document.getElementById('player-id-tag').style.display = 'block';
-            } else {
+            if (document.pointerLockElement !== document.body) {
                 instructions.style.display = 'flex';
+                // Reset button text just in case they return to menu
+                joinBtn.disabled = false;
+                createBtn.disabled = false;
+                joinBtn.innerText = "PORTA KATIL";
             }
         });
 
         // --- Multiplayer Sync ---
+        let syncUnsubscribe = null;
+        let syncInterval = null;
 
         function startSync() {
             if (!currentUser || !selectedPort) return;
+            if (syncUnsubscribe) return; // Already syncing
 
-            // Use permitted path: /artifacts/{appId}/public/data/{collectionName}/{docId}
             const collectionName = `players_port_${selectedPort}`;
             const playersCol = collection(db, 'artifacts', appId, 'public', 'data', collectionName);
 
             // Sync players
-            onSnapshot(playersCol, (snapshot) => {
+            syncUnsubscribe = onSnapshot(playersCol, (snapshot) => {
                 snapshot.docChanges().forEach((change) => {
                     const data = change.doc.data();
                     const id = change.doc.id;
@@ -268,11 +299,11 @@
                 });
                 document.getElementById('playerCount').innerText = snapshot.size;
             }, (error) => {
-                console.error("Sync Error:", error);
+                console.warn("Firestore listener error:", error);
             });
 
-            // Update local state
-            const syncTimer = setInterval(async () => {
+            // Update local state - Rule 3: Guarded by auth check
+            syncInterval = setInterval(async () => {
                 if (document.pointerLockElement === document.body && currentUser) {
                     const playerDoc = doc(db, 'artifacts', appId, 'public', 'data', collectionName, currentUser.uid);
                     try {
@@ -283,17 +314,22 @@
                             lastUpdate: serverTimestamp()
                         }, { merge: true });
                     } catch (e) {
-                        // Silent fail for occasional network jitters
+                        // Permissions error usually happens if user logs out mid-session
                     }
                 }
             }, 100);
 
-            window.addEventListener('beforeunload', () => {
-                if (currentUser) {
-                    const playerDoc = doc(db, 'artifacts', appId, 'public', 'data', collectionName, currentUser.uid);
-                    deleteDoc(playerDoc);
-                }
-            });
+            window.addEventListener('beforeunload', cleanupSync);
+        }
+
+        function cleanupSync() {
+            if (syncUnsubscribe) syncUnsubscribe();
+            if (syncInterval) clearInterval(syncInterval);
+            if (currentUser && selectedPort) {
+                const collectionName = `players_port_${selectedPort}`;
+                const playerDoc = doc(db, 'artifacts', appId, 'public', 'data', collectionName, currentUser.uid);
+                deleteDoc(playerDoc).catch(() => {});
+            }
         }
 
         function updatePlayerAvatar(id, data) {
@@ -366,7 +402,7 @@
                     case 'Space': if(val && velocity.y === 0) velocity.y += 12; break;
                 }
             };
-            document.addEventListener('keydown', (e) => keyHandler(e, true));
+            document.addEventListener('keydown', (keyHandler));
             document.addEventListener('keyup', (e) => keyHandler(e, false));
 
             let pitch = 0, yaw = 0;
