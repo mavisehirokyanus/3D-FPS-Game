@@ -161,25 +161,31 @@
         let gunGroup, muzzleFlash;
         let otherPlayers = {}; 
         let currentUser = null;
-        let currentPort = "";
+        let selectedPort = "";
         let isGameStarted = false;
 
         const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
 
         // --- Auth Initialization ---
         const initAuth = async () => {
+            if (currentUser) return currentUser;
             if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
-                await signInWithCustomToken(auth, __initial_auth_token);
+                const result = await signInWithCustomToken(auth, __initial_auth_token);
+                currentUser = result.user;
             } else {
-                await signInAnonymously(auth);
+                const result = await signInAnonymously(auth);
+                currentUser = result.user;
             }
+            return currentUser;
         };
 
         onAuthStateChanged(auth, (user) => {
             currentUser = user;
             if (user) {
                 document.getElementById('myId').innerText = user.uid;
-                if (isGameStarted) startSync();
+                if (isGameStarted && selectedPort) {
+                    startSync();
+                }
             }
         });
 
@@ -190,12 +196,15 @@
         const instructions = document.getElementById('instructions');
 
         async function startGame(port) {
-            currentPort = port;
+            selectedPort = port;
             document.getElementById('currentPort').innerText = port;
             
-            // Wait for auth before proceeding
-            if (!currentUser) {
+            // Start Auth early
+            try {
                 await initAuth();
+            } catch (e) {
+                console.error("Auth Error:", e);
+                return;
             }
 
             document.body.requestPointerLock();
@@ -204,6 +213,8 @@
             if (!isGameStarted) {
                 init();
                 isGameStarted = true;
+                // Double check sync start
+                if (currentUser) startSync();
             }
         }
 
@@ -236,14 +247,13 @@
         // --- Multiplayer Sync ---
 
         function startSync() {
-            if (!currentUser || !currentPort) return;
+            if (!currentUser || !selectedPort) return;
 
-            // MANDATORY RULE 1: Use strictly permitted paths
-            // Collection name includes port to segregate players
-            const collectionName = `players_port_${currentPort}`;
+            // Use permitted path: /artifacts/{appId}/public/data/{collectionName}/{docId}
+            const collectionName = `players_port_${selectedPort}`;
             const playersCol = collection(db, 'artifacts', appId, 'public', 'data', collectionName);
 
-            // Snapshot listener with error handling
+            // Sync players
             onSnapshot(playersCol, (snapshot) => {
                 snapshot.docChanges().forEach((change) => {
                     const data = change.doc.data();
@@ -258,11 +268,11 @@
                 });
                 document.getElementById('playerCount').innerText = snapshot.size;
             }, (error) => {
-                console.error("Firestore error:", error);
+                console.error("Sync Error:", error);
             });
 
-            // Update local player position
-            setInterval(async () => {
+            // Update local state
+            const syncTimer = setInterval(async () => {
                 if (document.pointerLockElement === document.body && currentUser) {
                     const playerDoc = doc(db, 'artifacts', appId, 'public', 'data', collectionName, currentUser.uid);
                     try {
@@ -273,7 +283,7 @@
                             lastUpdate: serverTimestamp()
                         }, { merge: true });
                     } catch (e) {
-                        console.error("Update failed:", e);
+                        // Silent fail for occasional network jitters
                     }
                 }
             }, 100);
@@ -380,9 +390,6 @@
 
             raycaster = new THREE.Raycaster();
             
-            // Trigger sync if auth was already completed
-            if (currentUser) startSync();
-
             window.addEventListener('resize', () => {
                 camera.aspect = window.innerWidth / window.innerHeight;
                 camera.updateProjectionMatrix();
